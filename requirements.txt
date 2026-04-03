@@ -1,5 +1,5 @@
 python-binance
-pandas==2.2.2
+pandas==2.1.4
 ta
 requests
 python-telegram-bot==20.3
