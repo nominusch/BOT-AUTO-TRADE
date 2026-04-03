@@ -1,0 +1,5 @@
+python-binance
+pandas==2.2.2
+ta
+requests
+python-telegram-bot
