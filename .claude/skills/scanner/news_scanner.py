@@ -1,2 +1,2 @@
 def run():
-    print("News Scanner!")
+    print("News Scanner running!")
