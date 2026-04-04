@@ -1,12 +1,38 @@
+# =====================
+# IMPORT
+# =====================
+import os
+import sys
+import time
+import threading
 import requests
 import pandas as pd
 import ta
-import time
-import os
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from telegram import Bot
-import threading
+import importlib
+import logging
+
+# =====================
+# LOGGING
+# =====================
+log_file = "bot.log"
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+def log_and_msg(text, level="info"):
+    send_msg(text)
+    if level=="info":
+        logging.info(text)
+    elif level=="error":
+        logging.error(text)
+    elif level=="warn":
+        logging.warning(text)
 
 # =====================
 # ENV
@@ -28,17 +54,17 @@ leverage = 3
 risk_per_trade = 0.01   # 1% modal per trade
 max_daily_loss = -0.03  # -3% modal harian
 
-# ATR-based dynamic stop & TP multipliers
 sl_multiplier = 1.5
 tp_multiplier = 3.0
+trailing_pct = 0.005
+dashboard_interval = 3600  # 1 jam
 
-trailing_pct = 0.005     # 0.5% initial trailing
-dashboard_interval = 3600  # 1 jam update ke Telegram
-
-positions = {}  # multi-position support
+positions = {}   # multi-position support
 daily_pnl = 0
 
-lock = threading.Lock()  # untuk thread-safe update positions / daily_pnl
+lock = threading.Lock()  # thread-safe
+
+loaded_skills = {}  # modul yang sudah di-load
 
 # =====================
 # UTILS
@@ -47,7 +73,7 @@ def send_msg(text):
     try:
         bot.send_message(chat_id=CHAT_ID, text=text)
     except:
-        pass
+        logging.error(f"Gagal kirim pesan Telegram: {text}")
 
 def get_balance():
     try:
@@ -55,7 +81,8 @@ def get_balance():
         for x in info["assets"]:
             if x["asset"] == "USDT":
                 return float(x["availableBalance"])
-    except (BinanceAPIException, BinanceRequestException):
+    except (BinanceAPIException, BinanceRequestException) as e:
+        logging.error(f"Error get_balance: {e}")
         return 0
     return 0
 
@@ -71,25 +98,17 @@ def get_data(symbol, interval):
         df = pd.DataFrame(requests.get(url).json())
         df = df[[0,1,2,3,4,5]]
         df.columns = ["time","open","high","low","close","volume"]
-        df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["open"] = df["open"].astype(float)
-        df["volume"] = df["volume"].astype(float)
+        for col in ["close","high","low","open","volume"]:
+            df[col] = df[col].astype(float)
         return df
-    except:
+    except Exception as e:
+        logging.error(f"Error get_data {symbol} {interval}: {e}")
         return pd.DataFrame()
 
 # =====================
-# TREND & AI FILTER MULTI-TIMEFRAME
+# TREND & AI FILTER
 # =====================
 def trend_ai_filter(df_short, df_medium, df_long):
-    """
-    Multi-timeframe AI filter:
-    - Short: 5m
-    - Medium: 15m
-    - Long: 1h
-    """
     def analyze(df):
         df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
         df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
@@ -101,16 +120,16 @@ def trend_ai_filter(df_short, df_medium, df_long):
             trend = "UP"
         elif last["close"] < last["ema20"] < last["ema50"] and 30 < last["rsi"] < 50:
             trend = "DOWN"
-        # AI candle filter
         body = abs(last["close"] - last["open"])
         candle_range = last["high"] - last["low"]
         volume_cond = last["volume"] > prev["volume"]
         ai_signal = (body > candle_range * 0.6) and volume_cond
         return trend, ai_signal
+
     trend_short, ai_short = analyze(df_short)
     trend_med, ai_med = analyze(df_medium)
     trend_long, ai_long = analyze(df_long)
-    # Signal valid hanya kalau semua timeframe searah
+
     if trend_short == trend_med == trend_long and ai_short and ai_med and ai_long:
         return trend_short
     return "SIDE"
@@ -152,7 +171,7 @@ def entry(symbol, side, df_long):
     global daily_pnl
     with lock:
         if daily_pnl <= max_daily_loss:
-            send_msg(f"⚠️ DAILY MAX LOSS TERCAPAI, STOP TRADING HARI INI")
+            log_and_msg("⚠️ DAILY MAX LOSS TERCAPAI, STOP TRADING HARI INI", "warn")
             return
     try:
         price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
@@ -169,9 +188,9 @@ def entry(symbol, side, df_long):
                 "tp": tp,
                 "trail_price": price
             }
-        send_msg(f"🚀 ENTRY {symbol} {side} | Price: {price:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
+        log_and_msg(f"🚀 ENTRY {symbol} {side} | Price: {price:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
     except Exception as e:
-        send_msg(f"Error ENTRY {symbol}: {e}")
+        log_and_msg(f"Error ENTRY {symbol}: {e}", "error")
 
 def exit_position(symbol, reason=""):
     global daily_pnl
@@ -186,9 +205,9 @@ def exit_position(symbol, reason=""):
         with lock:
             daily_pnl += pnl
             del positions[symbol]
-        send_msg(f"❌ EXIT {symbol} | PNL: {round(pnl*100,2)}% | {reason}")
+        log_and_msg(f"❌ EXIT {symbol} | PNL: {round(pnl*100,2)}% | {reason}")
     except Exception as e:
-        send_msg(f"Error EXIT {symbol}: {e}")
+        log_and_msg(f"Error EXIT {symbol}: {e}", "error")
 
 # =====================
 # MANAGE POSITION (SL / TP / TRAILING)
@@ -201,15 +220,13 @@ def manage_position(symbol, df_long):
         profit = (price - pos["entry"])/pos["entry"]
         if pos["side"]=="SELL": profit *= -1
 
-        # Stop loss
         if (pos["side"]=="BUY" and price<=pos["sl"]) or (pos["side"]=="SELL" and price>=pos["sl"]):
             exit_position(symbol, "STOP LOSS")
             return
-        # Take profit
         if (pos["side"]=="BUY" and price>=pos["tp"]) or (pos["side"]=="SELL" and price<=pos["tp"]):
             exit_position(symbol, "TAKE PROFIT")
             return
-        # Trailing stop
+
         with lock:
             if pos["side"]=="BUY":
                 if price > pos["trail_price"]:
@@ -222,7 +239,7 @@ def manage_position(symbol, df_long):
                 elif price > pos["trail_price"]*(1+trailing_pct):
                     exit_position(symbol, "TRAILING STOP")
     except Exception as e:
-        send_msg(f"Error MANAGE {symbol}: {e}")
+        log_and_msg(f"Error MANAGE {symbol}: {e}", "error")
 
 # =====================
 # DASHBOARD TELEGRAM
@@ -231,20 +248,48 @@ def dashboard_loop():
     while True:
         try:
             with lock:
-                pos_text = "\n".join([f"{s}: {p['side']} | Entry {p['entry']:.2f} | QTY {p['qty']}" for s,p in positions.items()])
-                if not pos_text:
-                    pos_text = "No active positions"
-                send_msg(f"📊 DASHBOARD\nDaily PNL: {round(daily_pnl*100,2)}%\nPositions:\n{pos_text}")
+                pos_text = "\n".join([f"{s}: {p['side']} | Entry {p['entry']:.2f} | QTY {p['qty']}" for s,p in positions.items()]) or "No active positions"
+                log_and_msg(f"📊 DASHBOARD\nDaily PNL: {round(daily_pnl*100,2)}%\nPositions:\n{pos_text}")
         except:
             pass
         time.sleep(dashboard_interval)
 
 # =====================
-# MAIN LOOP
+# LOAD SKILLS
 # =====================
-send_msg("✅ FUTURES BOT PRO AKTIF")
+def load_skills():
+    skills_folder = "./.claude/skills/trading"
+    if not os.path.exists(skills_folder):
+        log_and_msg(f"❌ Folder skills tidak ditemukan: {skills_folder}", "warn")
+        return
+
+    for skill_name in os.listdir(skills_folder):
+        skill_path = os.path.join(skills_folder, skill_name)
+        init_file = os.path.join(skill_path, "__init__.py")
+        if os.path.isdir(skill_path) and os.path.isfile(init_file):
+            module_name = f".claude.skills.trading.{skill_name}.main"
+            try:
+                if module_name in sys.modules:
+                    importlib.reload(sys.modules[module_name])
+                else:
+                    importlib.import_module(module_name)
+                loaded_skills[skill_name] = module_name
+                log_and_msg(f"✅ Skill '{skill_name}' berhasil di-load!")
+            except Exception as e:
+                log_and_msg(f"❌ Gagal load skill '{skill_name}': {e}", "error")
+
+def auto_reload_skills(interval=60):
+    while True:
+        load_skills()
+        time.sleep(interval)
+
+# =====================
+# MAIN
+# =====================
+log_and_msg("✅ AI AGENT AKTIF")
 
 threading.Thread(target=dashboard_loop, daemon=True).start()
+threading.Thread(target=auto_reload_skills, daemon=True).start()
 
 while True:
     try:
@@ -252,12 +297,15 @@ while True:
             df5 = get_data(symbol, "5m")
             df15 = get_data(symbol, "15m")
             df1h = get_data(symbol, "1h")
+
             trend_dir = trend_ai_filter(df5, df15, df1h)
             signal = generate_signal(df5)
-            if symbol not in positions and signal is not None and trend_dir != "SIDE":
+
+            if symbol not in positions and signal and trend_dir != "SIDE":
                 entry(symbol, signal, df1h)
+
             if symbol in positions:
                 manage_position(symbol, df1h)
     except Exception as e:
-        send_msg(f"Global Error: {e}")
+        log_and_msg(f"Global Error: {e}", "error")
     time.sleep(15)
