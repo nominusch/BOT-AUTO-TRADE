@@ -10,7 +10,8 @@ import pandas as pd
 import ta
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 import importlib
 import logging
 
@@ -25,15 +26,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-def log_and_msg(text, level="info"):
-    send_msg(text)
-    if level=="info":
-        logging.info(text)
-    elif level=="error":
-        logging.error(text)
-    elif level=="warn":
-        logging.warning(text)
-
 # =====================
 # ENV
 # =====================
@@ -41,6 +33,7 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+BSC_API_KEY = os.getenv("BSC_API_KEY")  # API key untuk BSCScan
 
 client = Client(API_KEY, API_SECRET)
 bot = Bot(token=TOKEN)
@@ -50,19 +43,18 @@ bot = Bot(token=TOKEN)
 # =====================
 pairs = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 leverage = 3
-risk_per_trade = 0.01   # 1% modal per trade
-max_daily_loss = -0.03  # -3% modal harian
-
+risk_per_trade = 0.01
+max_daily_loss = -0.20
 sl_multiplier = 1.5
 tp_multiplier = 3.0
 trailing_pct = 0.005
-dashboard_interval = 3600  # 1 jam
+dashboard_interval = 3600
 
-positions = {}   # multi-position support
+positions = {}
 daily_pnl = 0
-
-lock = threading.Lock()  # thread-safe
-loaded_skills = {}  # modul skill yang sudah di-load
+lock = threading.Lock()
+bot_active = False
+user_wallets = {}  # menyimpan wallet tiap user
 
 # =====================
 # UTILS
@@ -73,13 +65,22 @@ def send_msg(text):
     except:
         logging.error(f"Gagal kirim pesan Telegram: {text}")
 
+def log_and_msg(text, level="info"):
+    send_msg(text)
+    if level=="info":
+        logging.info(text)
+    elif level=="error":
+        logging.error(text)
+    elif level=="warn":
+        logging.warning(text)
+
 def get_balance():
     try:
         info = client.futures_account()
         for x in info["assets"]:
             if x["asset"] == "USDT":
                 return float(x["availableBalance"])
-    except (BinanceAPIException, BinanceRequestException) as e:
+    except Exception as e:
         logging.error(f"Error get_balance: {e}")
         return 0
     return 0
@@ -104,7 +105,7 @@ def get_data(symbol, interval):
         return pd.DataFrame()
 
 # =====================
-# TREND & AI FILTER
+# TREND & SIGNAL
 # =====================
 def trend_ai_filter(df_short, df_medium, df_long):
     def analyze(df):
@@ -132,9 +133,6 @@ def trend_ai_filter(df_short, df_medium, df_long):
         return trend_short
     return "SIDE"
 
-# =====================
-# SIGNAL GENERATOR
-# =====================
 def generate_signal(df_short):
     rsi = ta.momentum.rsi(df_short["close"], window=14).iloc[-1]
     last = df_short.iloc[-1]
@@ -149,9 +147,6 @@ def generate_signal(df_short):
         return "SELL"
     return None
 
-# =====================
-# ATR DYNAMIC STOP / TP
-# =====================
 def calc_atr_sl_tp(df, side, entry_price):
     atr = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14).iloc[-1]
     if side=="BUY":
@@ -163,7 +158,7 @@ def calc_atr_sl_tp(df, side, entry_price):
     return sl, tp
 
 # =====================
-# ENTRY & EXIT
+# ENTRY / EXIT / MANAGE
 # =====================
 def entry(symbol, side, df_long):
     global daily_pnl
@@ -178,14 +173,7 @@ def entry(symbol, side, df_long):
         sl, tp = calc_atr_sl_tp(df_long, side, price)
         client.futures_create_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
         with lock:
-            positions[symbol] = {
-                "entry": price,
-                "qty": qty,
-                "side": side,
-                "sl": sl,
-                "tp": tp,
-                "trail_price": price
-            }
+            positions[symbol] = {"entry": price,"qty": qty,"side": side,"sl": sl,"tp": tp,"trail_price": price}
         log_and_msg(f"🚀 ENTRY {symbol} {side} | Price: {price:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
     except Exception as e:
         log_and_msg(f"Error ENTRY {symbol}: {e}", "error")
@@ -207,9 +195,6 @@ def exit_position(symbol, reason=""):
     except Exception as e:
         log_and_msg(f"Error EXIT {symbol}: {e}", "error")
 
-# =====================
-# MANAGE POSITION (SL / TP / TRAILING)
-# =====================
 def manage_position(symbol, df_long):
     try:
         with lock:
@@ -253,75 +238,117 @@ def dashboard_loop():
         time.sleep(dashboard_interval)
 
 # =====================
-# LOAD & RUN SKILLS
+# TOKEN CHECKER
 # =====================
-def load_skills():
-    skills_folder = "./.claude/skills/trading"
-    if not os.path.exists(skills_folder):
-        log_and_msg(f"❌ Folder skills tidak ditemukan: {skills_folder}", "warn")
-        return
-
-    for skill_name in os.listdir(skills_folder):
-        skill_path = os.path.join(skills_folder, skill_name)
-        init_file = os.path.join(skill_path, "__init__.py")
-        if os.path.isdir(skill_path) and os.path.isfile(init_file):
-            module_name = f".claude.skills.trading.{skill_name}.main"
-            try:
-                if module_name in sys.modules:
-                    importlib.reload(sys.modules[module_name])
-                else:
-                    importlib.import_module(module_name)
-                loaded_skills[skill_name] = module_name
-                log_and_msg(f"✅ Skill '{skill_name}' berhasil di-load!")
-            except Exception as e:
-                log_and_msg(f"❌ Gagal load skill '{skill_name}': {e}", "error")
-
-def auto_reload_skills(interval=60):
-    while True:
-        load_skills()
-        time.sleep(interval)
-
-def run_skill(skill_name, *args, **kwargs):
-    """
-    Jalankan skill yang sudah di-load
-    """
-    if skill_name in loaded_skills:
-        module_name = loaded_skills[skill_name]
-        module = sys.modules.get(module_name)
-        if module and hasattr(module, "main"):
-            threading.Thread(target=module.main, args=args, kwargs=kwargs).start()
-            send_msg(f"▶️ Skill {skill_name} dijalankan")
-        else:
-            send_msg(f"❌ Skill {skill_name} tidak punya main()")
-    else:
-        send_msg(f"❌ Skill {skill_name} belum di-load")
-
-# =====================
-# MAIN
-# =====================
-log_and_msg("✅ AI-AGENT AKTIF")
-
-threading.Thread(target=dashboard_loop, daemon=True).start()
-threading.Thread(target=auto_reload_skills, daemon=True).start()
-
-# Contoh menjalankan skill otomatis setelah bot start
-# run_skill("airdrop-hunter", user="Ahmad")
-
-while True:
+def check_token_bscscan(token_address):
+    url = f"https://api.bscscan.com/api?module=token&action=getTokenInfo&contractaddress={token_address}&apikey={BSC_API_KEY}"
     try:
-        for symbol in pairs:
-            df5 = get_data(symbol, "5m")
-            df15 = get_data(symbol, "15m")
-            df1h = get_data(symbol, "1h")
+        r = requests.get(url).json()
+        if r["status"]=="1":
+            data = r["result"]
+            holders = int(data.get("holders",0))
+            total_supply = float(data.get("totalSupply",0))
+            return {"holders": holders, "total_supply": total_supply, "verified": True}
+        else:
+            return {"holders":0,"total_supply":0,"verified":False}
+    except:
+        return {"holders":0,"total_supply":0,"verified":False}
 
-            trend_dir = trend_ai_filter(df5, df15, df1h)
-            signal = generate_signal(df5)
+def check_token_pancake(token_address):
+    url = f"https://api.pancakeswap.info/api/v2/tokens/{token_address}"
+    try:
+        r = requests.get(url).json()
+        if "data" in r:
+            liquidity = float(r["data"].get("liquidity",0))
+            return liquidity
+        return 0
+    except:
+        return 0
 
-            if symbol not in positions and signal and trend_dir != "SIDE":
-                entry(symbol, signal, df1h)
+# =====================
+# TELEGRAM COMMAND HANDLER
+# =====================
+def start_command(update: Update, context: CallbackContext):
+    global bot_active
+    bot_active = True
+    update.message.reply_text("✅ Bot trading aktif!")
 
-            if symbol in positions:
-                manage_position(symbol, df1h)
-    except Exception as e:
-        log_and_msg(f"Global Error: {e}", "error")
-    time.sleep(15)
+def stop_command(update: Update, context: CallbackContext):
+    global bot_active
+    bot_active = False
+    update.message.reply_text("⛔ Bot trading dihentikan!")
+
+def positions_command(update: Update, context: CallbackContext):
+    if not positions:
+        update.message.reply_text("No active positions.")
+    else:
+        text = "\n".join([f"{s}: {p['side']} | Entry {p['entry']:.2f}" for s,p in positions.items()])
+        update.message.reply_text(text)
+
+def balance_command(update: Update, context: CallbackContext):
+    balance = get_balance()
+    update.message.reply_text(f"💰 Saldo USDT: {balance:.2f}")
+
+def set_wallet_command(update: Update, context: CallbackContext):
+    if len(context.args)!=1:
+        update.message.reply_text("Usage: /set_wallet <ADDRESS>")
+        return
+    user_wallets[update.effective_user.id] = context.args[0]
+    update.message.reply_text(f"✅ Wallet disimpan: {context.args[0]}")
+
+def check_token_command(update: Update, context: CallbackContext):
+    if len(context.args)!=1:
+        update.message.reply_text("Usage: /check_token <TOKEN_ADDRESS>")
+        return
+    token = context.args[0]
+    bsc = check_token_bscscan(token)
+    pancake = check_token_pancake(token)
+    text = f"Token {token}\nVerified: {bsc['verified']}\nHolders: {bsc['holders']}\nTotal Supply: {bsc['total_supply']}\nLiquidity Pancake: {pancake}"
+    update.message.reply_text(text)
+
+# =====================
+# RUN TELEGRAM
+# =====================
+updater = Updater(TOKEN, use_context=True)
+dp = updater.dispatcher
+dp.add_handler(CommandHandler("start", start_command))
+dp.add_handler(CommandHandler("stop", stop_command))
+dp.add_handler(CommandHandler("positions", positions_command))
+dp.add_handler(CommandHandler("balance", balance_command))
+dp.add_handler(CommandHandler("set_wallet", set_wallet_command))
+dp.add_handler(CommandHandler("check_token", check_token_command))
+updater.start_polling()
+log_and_msg("✅ Telegram bot siap menerima perintah...")
+
+# =====================
+# TRADING LOOP
+# =====================
+def trading_loop():
+    global bot_active
+    while True:
+        if bot_active:
+            try:
+                for symbol in pairs:
+                    df5 = get_data(symbol, "5m")
+                    df15 = get_data(symbol, "15m")
+                    df1h = get_data(symbol, "1h")
+
+                    trend_dir = trend_ai_filter(df5, df15, df1h)
+                    signal = generate_signal(df5)
+
+                    if symbol not in positions and signal and trend_dir != "SIDE":
+                        entry(symbol, signal, df1h)
+
+                    if symbol in positions:
+                        manage_position(symbol, df1h)
+            except Exception as e:
+                log_and_msg(f"Global Error: {e}", "error")
+        time.sleep(15)
+
+# =====================
+# START THREADS
+# =====================
+threading.Thread(target=dashboard_loop, daemon=True).start()
+threading.Thread(target=trading_loop, daemon=True).start()
+
+log_and_msg("✅ AI-AGENT AKTIF")
