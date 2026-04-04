@@ -49,7 +49,6 @@ bot = Bot(token=TOKEN)
 # CONFIG
 # =====================
 pairs = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-
 leverage = 3
 risk_per_trade = 0.01   # 1% modal per trade
 max_daily_loss = -0.03  # -3% modal harian
@@ -63,8 +62,7 @@ positions = {}   # multi-position support
 daily_pnl = 0
 
 lock = threading.Lock()  # thread-safe
-
-loaded_skills = {}  # modul yang sudah di-load
+loaded_skills = {}  # modul skill yang sudah di-load
 
 # =====================
 # UTILS
@@ -255,7 +253,7 @@ def dashboard_loop():
         time.sleep(dashboard_interval)
 
 # =====================
-# LOAD SKILLS
+# LOAD & RUN SKILLS
 # =====================
 def load_skills():
     skills_folder = "./.claude/skills/trading"
@@ -283,13 +281,31 @@ def auto_reload_skills(interval=60):
         load_skills()
         time.sleep(interval)
 
+def run_skill(skill_name, *args, **kwargs):
+    """
+    Jalankan skill yang sudah di-load
+    """
+    if skill_name in loaded_skills:
+        module_name = loaded_skills[skill_name]
+        module = sys.modules.get(module_name)
+        if module and hasattr(module, "main"):
+            threading.Thread(target=module.main, args=args, kwargs=kwargs).start()
+            send_msg(f"▶️ Skill {skill_name} dijalankan")
+        else:
+            send_msg(f"❌ Skill {skill_name} tidak punya main()")
+    else:
+        send_msg(f"❌ Skill {skill_name} belum di-load")
+
 # =====================
 # MAIN
 # =====================
-log_and_msg("✅ AI AGENT AKTIF")
+log_and_msg("✅ AI-AGENT AKTIF")
 
 threading.Thread(target=dashboard_loop, daemon=True).start()
 threading.Thread(target=auto_reload_skills, daemon=True).start()
+
+# Contoh menjalankan skill otomatis setelah bot start
+# run_skill("airdrop-hunter", user="Ahmad")
 
 while True:
     try:
